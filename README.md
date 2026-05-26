@@ -1,6 +1,6 @@
 # DATUM HW4 — Orchestrated AI Analytics System
 
-**ECE 157C / ECE 272C · University of California, Santa Barbara**
+**ECE 272C · University of California, Santa Barbara**
 
 ---
 
