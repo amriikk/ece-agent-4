@@ -1,12 +1,10 @@
 """
-backend/main.py — FastAPI gateway with SSE streaming for the HW4 orchestrated system.
+backend/main.py — FastAPI with direct SSE streaming.
 
-Endpoints:
-  POST /api/chat/stream  — primary SSE endpoint; streams per-event updates
-  POST /api/upload       — upload a financial CSV (year detected from filename)
-  POST /api/reset        — clear conversation memory and exec namespace
-  GET  /api/datasets     — list currently loaded datasets
-  GET  /api/health       — healthcheck
+Instead of running the full LangGraph orchestrator in a thread and
+flushing all events at the end, this version calls each agent step
+directly inside an async generator and yields SSE events in real-time.
+
 """
 
 import asyncio
@@ -15,6 +13,7 @@ import os
 import re
 import shutil
 import sys
+import traceback
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -22,16 +21,11 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import Any, List, Optional
 
-# Project root on path so imports resolve regardless of working directory
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from memory      import ConversationMemory
-from orchestrator import run as orchestrator_run
+from memory import ConversationMemory
 
-# ── App ───────────────────────────────────────────────────────────────────────
-
-app = FastAPI(title="DATUM HW4 — Orchestrated Analytics System")
-
+app = FastAPI(title="Datum HW4")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -40,14 +34,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Session memory (single-user; extend to per-session dict for multi-user) ───
-
+# ── Session memory ────────────────────────────────────────────────────────────
 _memory = ConversationMemory()
 
-DATASETS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "datasets")
+DATASETS_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "datasets"
+)
 os.makedirs(DATASETS_DIR, exist_ok=True)
 
-# Auto-load any CSVs already present in datasets/ at startup
+
 def _auto_load_datasets():
     for fname in sorted(os.listdir(DATASETS_DIR)):
         if not fname.endswith(".csv"):
@@ -63,172 +58,249 @@ def _auto_load_datasets():
         except Exception as e:
             print(f"  Failed to load {fname}: {e}")
 
+
 _auto_load_datasets()
 
-# ── Request / Response models ─────────────────────────────────────────────────
 
+# ── Request model ─────────────────────────────────────────────────────────────
 class ChatRequest(BaseModel):
     query: str
-    # chat_history sent from frontend for display only; memory object is authoritative
     chat_history: Optional[List[dict]] = []
 
 
-# ── SSE streaming endpoint ────────────────────────────────────────────────────
-
-@app.post("/api/chat/stream")
-async def chat_stream(request: ChatRequest):
-    """
-    Run the full orchestrator pipeline and stream SSE events as they're generated.
-
-    Event types (see ARCHITECTURE.md):
-      progress, iteration, validator, web_result, done, error
-    """
-    async def event_generator():
-        try:
-            # Run orchestrator synchronously in a thread so it doesn't block event loop
-            import concurrent.futures
-            loop = asyncio.get_event_loop()
-
-            with concurrent.futures.ThreadPoolExecutor() as pool:
-                future = loop.run_in_executor(
-                    pool,
-                    orchestrator_run,
-                    request.query,
-                    _memory,
-                )
-
-                # Poll for completion while yielding a heartbeat every 0.5s
-                # so the SSE connection stays alive
-                while not future.done():
-                    await asyncio.sleep(0.5)
-                    yield ": heartbeat\n\n"
-
-                final_state = await future
-
-            # Stream all queued SSE events
-            for event in final_state.get("sse_events", []):
-                payload = json.dumps(_make_serialisable(event))
-                yield f"data: {payload}\n\n"
-                await asyncio.sleep(0)
-
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            error_payload = json.dumps({"type": "error", "message": str(e)})
-            yield f"data: {error_payload}\n\n"
-
-    return StreamingResponse(
-        event_generator(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control":    "no-cache",
-            "X-Accel-Buffering":"no",
-        },
-    )
+# ── SSE helpers ───────────────────────────────────────────────────────────────
+def _sse(event: dict) -> str:
+    return f"data: {json.dumps(_safe(event))}\n\n"
 
 
-# ── Upload endpoint ───────────────────────────────────────────────────────────
-
-@app.post("/api/upload")
-async def upload_file(file: UploadFile = File(...)):
-    """
-    Upload a financial CSV. Year is detected from filename (e.g. 2014_Financial_Data.csv).
-    Saves to datasets/, resets exec namespace, loads into memory.
-    """
-    fname = file.filename or "upload.csv"
-    match = re.search(r"(\d{4})", fname)
-    if not match:
-        raise HTTPException(
-            status_code=400,
-            detail="Cannot detect year from filename. Include year (e.g. 2014_Financial_Data.csv)."
-        )
-    year = match.group(1)
-    dest = os.path.join(DATASETS_DIR, fname)
-
-    with open(dest, "wb") as buf:
-        shutil.copyfileobj(file.file, buf)
-
-    try:
-        df = _memory.load_dataset(dest, year)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to load dataset: {e}")
-
-    return {
-        "filename":     fname,
-        "year":         year,
-        "rows":         len(df),
-        "cols":         len(df.columns),
-        "dataset_path": dest,
-        "loaded_years": list(_memory.active_datasets.keys()),
-    }
-
-
-# ── Reset endpoint ────────────────────────────────────────────────────────────
-
-@app.post("/api/reset")
-async def reset_memory():
-    """Clear conversation history and exec namespace. Datasets remain loaded."""
-    _memory.chat_history.clear()
-    _memory.reset_namespace()
-    # Re-inject datasets into namespace
-    for year, df in _memory.active_datasets.items():
-        _memory.namespace[f"df_{year}"] = df
-    return {"status": "reset", "datasets_preserved": list(_memory.active_datasets.keys())}
-
-
-# ── Dataset list endpoint ─────────────────────────────────────────────────────
-
-@app.get("/api/datasets")
-async def list_datasets():
-    """Return currently loaded datasets with basic stats."""
-    result = []
-    for year, df in sorted(_memory.active_datasets.items()):
-        result.append({
-            "year":    year,
-            "rows":    len(df),
-            "cols":    len(df.columns),
-            "sectors": df["Sector"].nunique() if "Sector" in df.columns else 0,
-        })
-    return {"datasets": result}
-
-
-# ── Healthcheck ───────────────────────────────────────────────────────────────
-
-@app.get("/api/health")
-async def health():
-    return {
-        "status":          "ok",
-        "loaded_years":    list(_memory.active_datasets.keys()),
-        "history_turns":   len(_memory.chat_history),
-        "namespace_vars":  _memory.snapshot_namespace_keys(),
-    }
-
-
-# ── Serialisation helper ──────────────────────────────────────────────────────
-
-def _make_serialisable(obj: Any) -> Any:
-    """Recursively ensure an object is JSON-serialisable for SSE payloads."""
-    import pandas as pd
-    import numpy as np
-
+def _safe(obj: Any) -> Any:
+    import pandas as pd, numpy as np
     if isinstance(obj, dict):
-        return {str(k): _make_serialisable(v) for k, v in obj.items()}
+        return {str(k): _safe(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
-        return [_make_serialisable(i) for i in obj]
+        return [_safe(i) for i in obj]
     if isinstance(obj, pd.DataFrame):
         return json.loads(obj.head(10).to_json(orient="records"))
     if isinstance(obj, pd.Series):
         return json.loads(obj.to_json())
-    if isinstance(obj, np.integer):
-        return int(obj)
-    if isinstance(obj, np.floating):
-        return float(obj)
-    if isinstance(obj, np.bool_):
-        return bool(obj)
-    if isinstance(obj, np.ndarray):
-        return obj.tolist()
-    if hasattr(obj, "name") and "Dtype" in type(obj).__name__:
-        return str(obj)
-    if isinstance(obj, (int, float, str, bool, type(None))):
-        return obj
+    if isinstance(obj, np.integer):  return int(obj)
+    if isinstance(obj, np.floating): return float(obj)
+    if isinstance(obj, np.bool_):    return bool(obj)
+    if isinstance(obj, np.ndarray):  return obj.tolist()
+    if "Dtype" in type(obj).__name__: return str(obj)
+    if isinstance(obj, (int, float, str, bool, type(None))): return obj
     return str(obj)
+
+
+# ── Classify query ────────────────────────────────────────────────────────────
+def _classify(query: str, has_datasets: bool) -> str:
+    """Returns 'analytics' or 'generic'."""
+    if not has_datasets:
+        return "generic"
+    import anthropic
+    client = anthropic.Anthropic()
+    resp = client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=10,
+        messages=[{"role": "user", "content": (
+            f'Query: "{query}"\n\n'
+            "Is this about financial data analysis (stocks, sectors, ROE, revenue, "
+            "companies, metrics, returns) or is it a general knowledge question?\n"
+            "Output ONLY: ANALYTICS or GENERIC"
+        )}],
+    )
+    return "analytics" if "ANALYTICS" in resp.content[0].text.upper() else "generic"
+
+
+# ── Main streaming endpoint ───────────────────────────────────────────────────
+@app.post("/api/chat/stream")
+async def chat_stream(request: ChatRequest):
+
+    async def generate():
+        query = request.query
+        _memory.add_user_message(query)
+
+        # ── Step 1: Classify ───────────────────────────────────────────────
+        yield _sse({"type": "progress", "message": "⚙ Classifying intent..."})
+        await asyncio.sleep(0)
+
+        try:
+            loop = asyncio.get_event_loop()
+            query_type = await loop.run_in_executor(
+                None, _classify, query, bool(_memory.active_datasets)
+            )
+        except Exception as e:
+            yield _sse({"type": "error", "message": f"Classification failed: {e}"})
+            return
+
+        print(f"\n--- QUERY TYPE: {query_type} | '{query}' ---\n")
+
+        # ── Generic path: web search ───────────────────────────────────────
+        if query_type == "generic":
+            yield _sse({"type": "progress", "message": f"🔍 Searching the web..."})
+            await asyncio.sleep(0)
+            try:
+                from web_search import run as web_run
+                result = await loop.run_in_executor(None, web_run, query)
+                answer    = result.get("answer", "No results found.")
+                citations = result.get("citations", [])
+                for r in result.get("raw_results", []):
+                    yield _sse({"type": "web_result",
+                                "title": r.title, "url": r.url, "snippet": r.snippet})
+                    await asyncio.sleep(0)
+                yield _sse({"type": "progress", "message": "💬 Composing answer..."})
+                yield _sse({"type": "done", "answer": answer,
+                             "plots": [], "citations": citations})
+                _memory.add_assistant_message(answer)
+            except Exception as e:
+                traceback.print_exc()
+                yield _sse({"type": "error", "message": f"Web search failed: {e}"})
+            return
+
+        # ── Analytics path ─────────────────────────────────────────────────
+        yield _sse({"type": "progress", "message": "🔬 Auto-inspecting datasets..."})
+        await asyncio.sleep(0)
+
+        analytics_output = None
+        try:
+            from analytics_agent import run as analytics_run
+
+            # Run analytics agent in thread (it's synchronous + slow)
+            def _run_analytics():
+                return analytics_run(query, _memory)
+
+            yield _sse({"type": "progress",
+                        "message": "✍ Reasoning + writing analysis code..."})
+            await asyncio.sleep(0)
+
+            analytics_output = await loop.run_in_executor(None, _run_analytics)
+
+            # Stream per-iteration trace events
+            for t in analytics_output.get("trace", []):
+                if t["n"] == 0:
+                    continue
+                yield _sse({"type": "iteration",
+                             "n": t["n"],
+                             "reasoning": t.get("reasoning", ""),
+                             "code": t.get("code", "")[:600],
+                             "observation": t.get("observation", "")[:600]})
+                await asyncio.sleep(0)
+
+        except Exception as e:
+            traceback.print_exc()
+            yield _sse({"type": "error",
+                        "message": f"Analytics agent failed: {e}"})
+            return
+
+        # ── Validator ──────────────────────────────────────────────────────
+        yield _sse({"type": "progress",
+                    "message": "🧪 Validator independently checking results..."})
+        await asyncio.sleep(0)
+
+        validator_verdict = "APPROVED"
+        retry_count       = 0
+        MAX_RETRIES       = 1
+
+        while True:
+            try:
+                import pandas as pd
+                from validator_agent import validate as validator_run
+
+                result_df = analytics_output.get("result")
+                if not isinstance(result_df, pd.DataFrame):
+                    result_df = None
+
+                v_out = await loop.run_in_executor(
+                    None, validator_run,
+                    query,
+                    analytics_output.get("answer", ""),
+                    result_df,
+                    _memory,
+                )
+
+                validator_verdict = v_out.get("verdict", "APPROVED")
+                reason            = v_out.get("reason", "")
+
+                yield _sse({"type": "validator",
+                             "verdict": validator_verdict, "reason": reason})
+                await asyncio.sleep(0)
+
+                # Retry if validator says RETRY and we haven't exceeded limit
+                if validator_verdict.startswith("RETRY") and retry_count < MAX_RETRIES:
+                    retry_count += 1
+                    yield _sse({"type": "progress",
+                                "message": f"🔄 Re-running analysis (retry {retry_count})..."})
+                    await asyncio.sleep(0)
+                    analytics_output = await loop.run_in_executor(None, _run_analytics)
+                else:
+                    break
+
+            except Exception as e:
+                traceback.print_exc()
+                # Validator failure is non-fatal — just log and continue
+                print(f"Validator error: {e}")
+                yield _sse({"type": "validator",
+                             "verdict": "APPROVED",
+                             "reason": f"Validator skipped: {e}"})
+                break
+
+        # ── Final response ─────────────────────────────────────────────────
+        answer = analytics_output.get("answer", "Analysis complete.")
+        plots  = [_safe(p) for p in analytics_output.get("plots", [])]
+
+        yield _sse({"type": "progress", "message": "✅ Analysis complete"})
+        yield _sse({"type": "done", "answer": answer,
+                     "plots": plots, "citations": []})
+        _memory.add_assistant_message(answer)
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+# ── Upload ────────────────────────────────────────────────────────────────────
+@app.post("/api/upload")
+async def upload_file(file: UploadFile = File(...)):
+    fname = file.filename or "upload.csv"
+    match = re.search(r"(\d{4})", fname)
+    if not match:
+        raise HTTPException(400, "Year not found in filename")
+    year = match.group(1)
+    dest = os.path.join(DATASETS_DIR, fname)
+    with open(dest, "wb") as buf:
+        shutil.copyfileobj(file.file, buf)
+    try:
+        df = _memory.load_dataset(dest, year)
+    except Exception as e:
+        raise HTTPException(500, f"Failed to load: {e}")
+    return {"filename": fname, "year": year, "rows": len(df),
+            "cols": len(df.columns), "loaded_years": list(_memory.active_datasets.keys())}
+
+
+# ── Reset ─────────────────────────────────────────────────────────────────────
+@app.post("/api/reset")
+async def reset():
+    _memory.chat_history.clear()
+    _memory.reset_namespace()
+    for year, df in _memory.active_datasets.items():
+        _memory.namespace[f"df_{year}"] = df
+    return {"status": "reset", "datasets": list(_memory.active_datasets.keys())}
+
+
+# ── Datasets list ─────────────────────────────────────────────────────────────
+@app.get("/api/datasets")
+async def list_datasets():
+    result = []
+    for year, df in sorted(_memory.active_datasets.items()):
+        result.append({"year": year, "rows": len(df), "cols": len(df.columns)})
+    return {"datasets": result}
+
+
+# ── Health ────────────────────────────────────────────────────────────────────
+@app.get("/api/health")
+async def health():
+    return {"status": "ok",
+            "loaded_years": list(_memory.active_datasets.keys()),
+            "history_turns": len(_memory.chat_history)}

@@ -1,5 +1,6 @@
 import React, { useState, useRef, useEffect } from 'react';
 import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 import './App.css';
 
 const IconSend = () => (
@@ -149,12 +150,12 @@ function DatasetBar({ datasets, onUpload }) {
 }
 
 const SUGGESTIONS = [
-  { icon: '📊', text: 'What does this dataset contain?' },
-  { icon: '📈', text: 'Compare ROE of Technology vs Healthcare 2015–2018' },
-  { icon: '🔍', text: 'Find undervalued Tech stocks in 2017 (PE ratio < 15)' },
-  { icon: '🌐', text: 'What caused the 2016 oil price crash?' },
-  { icon: '💹', text: 'Which sectors had highest revenue growth in 2016?' },
-  { icon: '📉', text: 'Show free cash flow trends across all years' },
+  { icon: '🔭', text: 'Compare average PE ratio across all sectors from 2014 to 2018' },
+  { icon: '📊', text: 'Compare ROE of Technology vs Healthcare across 2015–2018' },
+  { icon: '⚡', text: 'Which sectors generated the strongest alpha in 2017?' },
+  { icon: '🌐', text: 'What is the efficient market hypothesis?' },
+  { icon: '🏭', text: 'Rank semiconductor stocks by free cash flow yield in 2018' },
+  { icon: '📉', text: 'How did the Energy sector PE ratio evolve from 2014 to 2018?' },
 ];
 
 export default function App() {
@@ -259,10 +260,10 @@ export default function App() {
       <header className="header">
         <div className="header-left">
           <div className="logo-mark">
-            <div className="logo-icon">D</div>
-            <span className="logo-name">Datum</span>
+            <div className="logo-icon">S</div>
+            <span className="logo-name">Signal</span>
           </div>
-          <span className="logo-badge">HW4</span>
+          <span className="logo-badge">α</span>
         </div>
         <div className="header-right">
           <DatasetBar datasets={loadedYears} onUpload={handleFileUpload} />
@@ -274,8 +275,8 @@ export default function App() {
         {messages.length === 0 && !isLoading && (
           <div className="empty-state">
             <div className="empty-icon">◈</div>
-            <h2 className="empty-title">What would you like to analyze?</h2>
-            <p className="empty-hint">Ask about financial metrics, sector trends, and stock comparisons — or any general question answered by web search.</p>
+            <h2 className="empty-title">What signal are you looking for?</h2>
+            <p className="empty-hint">Multi-agent financial analytics powered by Claude. Five years of US equity data loaded — ask about sector trends, valuations, and market signals, or search the web.</p>
             <div className="suggestion-grid">
               {SUGGESTIONS.map(s => (
                 <button key={s.text} className="suggestion-card" onClick={() => { setInput(s.text); inputRef.current?.focus(); }}>
@@ -291,7 +292,7 @@ export default function App() {
           if (msg.role === 'system') return (
             <div key={i} className="system-notice">
               <span className="system-dot">●</span>
-              <ReactMarkdown>{msg.content}</ReactMarkdown>
+              <ReactMarkdown remarkPlugins={[remarkGfm]}>{msg.content}</ReactMarkdown>
             </div>
           );
           if (msg.role === 'user') return (
@@ -303,11 +304,11 @@ export default function App() {
             <div key={i} className="message-row ai">
               <div className="bubble-ai-wrap">
                 <div className="ai-header">
-                  <div className="ai-avatar">D</div>
-                  <span className="ai-label">Datum AI</span>
+                  <div className="ai-avatar">S</div>
+                  <span className="ai-label">Signal</span>
                 </div>
                 <div className="bubble-ai">
-                  <div className="ai-content"><ReactMarkdown>{msg.content}</ReactMarkdown></div>
+                  <div className="ai-content"><ReactMarkdown remarkPlugins={[remarkGfm]}>{msg.content}</ReactMarkdown></div>
                   <CitationStrip citations={msg.citations} />
                   {msg.plots?.map((p, pi) => (
                     <div key={pi} className="chart-container">
@@ -338,7 +339,7 @@ export default function App() {
             <textarea
               ref={inputRef} className="query-textarea" value={input}
               onChange={e => setInput(e.target.value)} onKeyDown={handleKeyDown}
-              placeholder="Ask about financial data or any general question..."
+              placeholder="Ask about market signals, valuations, sector trends..."
               disabled={isLoading} rows={1}
             />
             <button className="send-btn" onClick={handleSubmit} disabled={isLoading || !input.trim()} title="Send">
@@ -347,7 +348,7 @@ export default function App() {
           </div>
         </div>
         <div className="footer-meta">
-          <span>Shift+Enter for new line · Enter to send</span>
+          <span>Shift+Enter for new line · Enter to run analysis</span>
           <span className="status-pip">
             <span className={`pip-dot ${isLoading ? 'busy' : ''}`} />
             {isLoading ? 'Processing' : 'Ready'}

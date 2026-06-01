@@ -1,14 +1,14 @@
 """
 analytics_agent.py — Iterative analytics sandbox with persistent exec namespace.
 
-Unlike HW2's one-shot code generation, this agent:
+Unlike ECE-A2's one-shot code generation, this agent:
   1. Auto-inspects datasets on the first iteration
   2. Reasons about what to do next after each observation
   3. Executes code in a persistent namespace (variables survive across iterations)
   4. Extracts Plotly figures automatically
   5. Decides when to stop (DONE) based on whether the question is answered
 
-MAX_ITERATIONS = 6 per query (safety cap)
+MAX_ITERATIONS = 4 per query (safety cap)
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ from memory import ConversationMemory
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-MAX_ITERATIONS = 6
+MAX_ITERATIONS = 4
 
 # Libraries pre-injected into every exec() call so generated code never imports them
 EXEC_GLOBALS = {
@@ -81,10 +81,15 @@ Rules:
 5. Code must be valid Python. No markdown fences inside the JSON.
 6. For visualisations: use px or go, assign figure to a variable ending in _fig
    (e.g. trend_fig = px.line(...)). The system will auto-extract all _fig variables.
+   NEVER call fig.show(), fig.write_html(), or fig.write_image() — these open browser tabs.
+   Just assign: my_fig = px.bar(...) and stop. The framework handles display.
 7. Always assign your final analysis result to a variable named `result` (DataFrame or scalar).
 8. Do NOT try to import libraries — pd, np, px, go are already available.
 9. Be specific with column names — they are case-sensitive.
 10. For multi-year analysis, use variables like df_2014, df_2015 etc. and pd.concat().
+11. IMPORTANT: Once you have computed the result AND created a visualisation, output action=DONE immediately.
+    Do NOT create multiple charts in separate iterations. One chart per answer is enough.
+    Do NOT keep running CODE after a chart has been created.
 """
 
 ITERATION_PROMPT_TEMPLATE = """
@@ -128,6 +133,12 @@ def run(question: str, memory: ConversationMemory) -> Dict[str, Any]:
     plots: List[Dict] = []
     traces: List[Dict] = []
     final_answer = ""
+
+    # Clear any _fig variables left over from previous queries so stale
+    # charts don't get re-extracted and show up as duplicates
+    stale_figs = [k for k in list(namespace.keys()) if k.endswith("_fig")]
+    for k in stale_figs:
+        del namespace[k]
 
     # ── Iteration 0: auto-inspect ─────────────────────────────────────────────
     observation = _exec_code(AUTO_INSPECT_CODE, namespace)
@@ -238,6 +249,12 @@ def _exec_code(code: str, namespace: dict) -> str:
 
     exec_ns = {**EXEC_GLOBALS, **namespace}
 
+    # Strip any fig.show() / fig.write_html() calls that would open browser tabs
+    code = re.sub(r'\bfig\.show\s*\([^)]*\)', '# fig.show() blocked', code)
+    code = re.sub(r'\w+_fig\.show\s*\([^)]*\)', '# fig.show() blocked', code)
+    code = re.sub(r'\.write_html\s*\([^)]*\)', '# write_html blocked', code)
+    code = re.sub(r'\.write_image\s*\([^)]*\)', '# write_image blocked', code)
+
     try:
         exec(code, exec_ns)  # noqa: S102
         # Sync any new variables back into the shared namespace
@@ -254,20 +271,41 @@ def _exec_code(code: str, namespace: dict) -> str:
 
 
 def _parse_response(raw: str) -> Tuple[dict, Optional[str]]:
-    """Strip markdown fences and parse JSON from LLM output."""
-    clean = re.sub(r"^```json\s*", "", raw)
+    """
+    Strip markdown fences and parse JSON from LLM output.
+    Also handles LLMs that embed literal newlines inside JSON string values,
+    which causes standard json.loads to fail with 'Extra data' or 'Invalid control'.
+    """
+    clean = re.sub(r"^```json\s*", "", raw.strip())
     clean = re.sub(r"^```\s*",     "", clean)
-    clean = re.sub(r"\s*```$",     "", clean)
+    clean = re.sub(r"\s*```$",     "", clean).strip()
+
+    # Try direct parse first
     try:
         return json.loads(clean), None
-    except json.JSONDecodeError as e:
+    except json.JSONDecodeError:
+        pass
+
+    # Fallback: find the outermost {...} block and parse that
+    try:
+        start = clean.index("{")
+        end   = clean.rindex("}") + 1
+        return json.loads(clean[start:end]), None
+    except (ValueError, json.JSONDecodeError) as e:
         return {}, str(e)
 
 
 def _extract_plots(namespace: dict) -> List[Dict]:
-    """Find all variables ending in _fig and extract their Plotly JSON."""
-    plots = []
-    for k, v in namespace.items():
+    """
+    Extract Plotly figures from namespace (variables ending in _fig).
+    Returns at most ONE plot — the most recently created one.
+    Multiple charts per answer clutters the UI; the agent should pick one chart type.
+    Iterates over list() copy to avoid "dictionary changed size during iteration".
+    """
+    candidates = []
+    to_delete  = []
+
+    for k, v in list(namespace.items()):
         if k.endswith("_fig") and hasattr(v, "to_json"):
             try:
                 fig_json = json.loads(v.to_json())
@@ -276,12 +314,16 @@ def _extract_plots(namespace: dict) -> List[Dict]:
                     if hasattr(v, "layout") and v.layout.title and v.layout.title.text
                     else k.replace("_fig", "").replace("_", " ").title()
                 )
-                plots.append({"title": title, "plotly_json": fig_json})
-                # Remove from namespace so it's not re-extracted next iteration
-                del namespace[k]
+                candidates.append({"title": title, "plotly_json": fig_json})
+                to_delete.append(k)
             except Exception:
                 pass
-    return plots
+
+    for k in to_delete:
+        del namespace[k]
+
+    # Return only the last figure — it's the most refined version
+    return candidates[-1:] if candidates else []
 
 
 def _format_iteration_history(traces: List[Dict]) -> str:
